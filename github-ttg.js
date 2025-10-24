@@ -19,6 +19,7 @@
  *   SINCE_DATE - Start date for analysis (YYYY-MM-DD format, default: 2025-08-11)
  *   UNTIL_DATE - End date for analysis (YYYY-MM-DD format, default: 2025-08-19)
  *   GITHUB_WORKFLOW_RUN_NAME - Name of the workflow to analyze (default: CI)
+ *   OUTPUT_FILE_NAME - Name of the output file (default: ttg-github-data-<identifier>-<timestamp>.csv)
  *
  * EXAMPLES:
  *   # Basic usage
@@ -239,11 +240,13 @@ function convertTTGDataToCSV(data) {
  * @returns {string}
  */
 function saveTTGDataToCSV(data, platform, identifier) {
-  const outputPath = join(process.cwd(), 'output', 'ttg');
+  const outputPath = join(process.cwd(), 'output', platform);
   mkdirSync(outputPath, { recursive: true });
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `ttg-${platform}-data-${identifier}-${timestamp}.csv`;
+  const filename =
+    process.env.OUTPUT_FILE_NAME ||
+    `ttg-${platform}-data-${identifier}-${timestamp}.csv`;
   const filepath = join(outputPath, filename);
 
   const csvContent = convertTTGDataToCSV(data);
@@ -507,9 +510,6 @@ async function fetchWorkflowRunsForCommits(commitShas) {
   return allRuns;
 }
 
-// ============================================================================
-// LOGGING UTILITIES
-// ============================================================================
 
 // ============================================================================
 // MAIN EXECUTION FUNCTION
@@ -612,7 +612,8 @@ async function runAnalysis() {
               build_excluded_duration_ms: 0, // No stage exclusions for GitHub
               build_excluded_stages: '', // No stage exclusions for GitHub
               build_author: run.actor?.login || '',
-              build_requested_for: run.triggering_actor?.login || run.actor?.login || '',
+              build_requested_for:
+                run.triggering_actor?.login || run.actor?.login || '',
             });
           }
           return {

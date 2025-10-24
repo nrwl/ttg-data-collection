@@ -21,6 +21,7 @@
  *   SINCE_DATE - Start date for analysis (YYYY-MM-DD format, default: 2025-08-11)
  *   UNTIL_DATE - End date for analysis (YYYY-MM-DD format, default: 2025-08-19)
  *   EXCLUDED_STAGES - Comma-separated list of pipeline stage names to exclude from duration calculation
+ *   OUTPUT_FILE_NAME - Name of the output file (default: ttg-azure-devops-data-<identifier>-<timestamp>.csv)
  *
  * EXAMPLES:
  *   # Basic usage
@@ -277,12 +278,13 @@ function convertTTGDataToCSV(data) {
  * @returns {string}
  */
 function saveTTGDataToCSV(data, platform, identifier) {
-  const scriptDir = dirname(__filename);
-  const outputPath = join(scriptDir, 'output', 'ttg');
+  const outputPath = join(process.cwd(), 'output', platform);
   mkdirSync(outputPath, { recursive: true });
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `ttg-${platform}-data-${identifier}-${timestamp}.csv`;
+  const filename =
+    process.env.OUTPUT_FILE_NAME ||
+    `ttg-${platform}-data-${identifier}-${timestamp}.csv`;
   const filepath = join(outputPath, filename);
 
   const csvContent = convertTTGDataToCSV(data);
@@ -838,15 +840,21 @@ async function runAnalysis() {
             console.log(`    📊 Build ${build.id}${excludedTimeStr}`);
 
             // For Azure DevOps, prefer PR author over build requester since builds are often triggered by service accounts
-            const prAuthor = pr.createdBy?.displayName || pr.createdBy?.uniqueName || '';
-            const buildAuthor = build.requestedBy?.displayName || build.requestedBy?.uniqueName || '';
-            
+            const prAuthor =
+              pr.createdBy?.displayName || pr.createdBy?.uniqueName || '';
+            const buildAuthor =
+              build.requestedBy?.displayName ||
+              build.requestedBy?.uniqueName ||
+              '';
+
             // Use PR author if build author is a service account, otherwise use build author
-            const isServiceAccount = buildAuthor.includes('Microsoft.VisualStudio.Services') || 
-                                    buildAuthor.includes('System') || 
-                                    buildAuthor === 'Microsoft.VisualStudio.Services.TFS';
-            const effectiveAuthor = isServiceAccount && prAuthor ? prAuthor : buildAuthor;
-            
+            const isServiceAccount =
+              buildAuthor.includes('Microsoft.VisualStudio.Services') ||
+              buildAuthor.includes('System') ||
+              buildAuthor === 'Microsoft.VisualStudio.Services.TFS';
+            const effectiveAuthor =
+              isServiceAccount && prAuthor ? prAuthor : buildAuthor;
+
             prData.push({
               platform: 'azure-devops',
               repository,
@@ -863,7 +871,10 @@ async function runAnalysis() {
               build_excluded_duration_ms: exclusionData.excludedDurationMs,
               build_excluded_stages: exclusionData.excludedStages.join('; '),
               build_author: effectiveAuthor,
-              build_requested_for: build.requestedFor?.displayName || build.requestedFor?.uniqueName || '',
+              build_requested_for:
+                build.requestedFor?.displayName ||
+                build.requestedFor?.uniqueName ||
+                '',
             });
           }
           return {
