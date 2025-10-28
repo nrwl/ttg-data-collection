@@ -16,6 +16,8 @@
  *   GITHUB_REPO - GitHub repository name
  *
  * OPTIONAL ENVIRONMENT VARIABLES:
+ *   GITHUB_API_URL - GitHub API base URL (default: https://api.github.com)
+ *                    Use this to connect to private GitHub Enterprise instances
  *   SINCE_DATE - Start date for analysis (YYYY-MM-DD format, default: 2025-08-11)
  *   UNTIL_DATE - End date for analysis (YYYY-MM-DD format, default: 2025-08-19)
  *   GITHUB_WORKFLOW_RUN_NAME - Name of the workflow to analyze (default: CI)
@@ -29,6 +31,11 @@
  *   # Custom date range and workflow
  *   SINCE_DATE=2025-01-01 UNTIL_DATE=2025-01-31 \
  *   GITHUB_WORKFLOW_RUN_NAME="Build and Test" \
+ *   GITHUB_TOKEN=ghp_xxx GITHUB_OWNER=myorg GITHUB_REPO=myrepo \
+ *   node github-ttg.js
+ *
+ *   # Using with private GitHub Enterprise instance
+ *   GITHUB_API_URL=https://github.mycompany.com/api/v3 \
  *   GITHUB_TOKEN=ghp_xxx GITHUB_OWNER=myorg GITHUB_REPO=myrepo \
  *   node github-ttg.js
  *
@@ -59,6 +66,7 @@ const { join } = require('path');
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_OWNER || 'nrwl';
 const GITHUB_REPO = process.env.GITHUB_REPO || 'nx';
+const GITHUB_API_URL = process.env.GITHUB_API_URL || 'https://api.github.com';
 const SINCE_DATE = process.env.SINCE_DATE || '2025-08-11';
 const UNTIL_DATE = process.env.UNTIL_DATE || '2025-08-19';
 const GITHUB_WORKFLOW_RUN_NAME = process.env.GITHUB_WORKFLOW_RUN_NAME || 'CI';
@@ -374,7 +382,7 @@ async function fetchPullRequests(since, until) {
     // Use GitHub Search API with precise date filtering
     const searchQuery = `repo:${GITHUB_OWNER}/${GITHUB_REPO} is:pr created:${sinceDate}..${untilDate}`;
     const encodedQuery = encodeURIComponent(searchQuery);
-    const url = `https://api.github.com/search/issues?q=${encodedQuery}&sort=created&order=desc&per_page=100&page=${page}`;
+    const url = `${GITHUB_API_URL}/search/issues?q=${encodedQuery}&sort=created&order=desc&per_page=100&page=${page}`;
 
     const data = await makeGitHubRequest(url);
 
@@ -432,7 +440,7 @@ async function fetchPRCommits(prNumber) {
   let hasMore = true;
 
   while (hasMore) {
-    const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/commits?page=${page}&per_page=100`;
+    const url = `${GITHUB_API_URL}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/commits?page=${page}&per_page=100`;
     const data = await makeGitHubRequest(url);
 
     if (!Array.isArray(data) || data.length === 0) {
@@ -476,7 +484,7 @@ async function fetchWorkflowRunsForCommits(commitShas) {
       let hasMore = true;
 
       while (hasMore) {
-        const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/actions/runs?head_sha=${sha}&page=${page}&per_page=100`;
+        const url = `${GITHUB_API_URL}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/actions/runs?head_sha=${sha}&page=${page}&per_page=100`;
         const data = await makeGitHubRequest(url);
 
         const items = data.workflow_runs || [];
