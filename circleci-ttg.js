@@ -472,6 +472,20 @@ async function fetchPipelines(since, until) {
 
     allPipelines.push(...filteredPipelines);
 
+    // CircleCI returns pipelines in reverse chronological order (newest first).
+    // Once all pipelines on a page are older than the `since` date, every
+    // subsequent page will only contain even older pipelines — stop early to
+    // avoid paginating through the entire project history.
+    const allBeforeSince = data.items.every(
+      (p) => new Date(p.created_at) < new Date(since)
+    );
+    if (allBeforeSince) {
+      console.log(
+        `  ⏹️  All pipelines on this page are before ${sinceDate}, stopping pagination`
+      );
+      break;
+    }
+
     // Check for more pages
     pageToken = data.next_page_token;
     hasMore = !!pageToken;
