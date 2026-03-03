@@ -3,10 +3,10 @@
 /**
  * SELF-CONTAINED CIRCLECI TIME TO GREEN (TTG) DATA COLLECTION SCRIPT
  *
- * This script collects Time to Green metrics from CircleCI by fetching Pipelines
- * and their associated workflow runs. It integrates with GitHub API to get PR details
- * for PR-triggered pipelines, providing comprehensive TTG data for analyzing
- * development velocity and CI performance.
+ * This script collects Time to Green metrics from CircleCI using a PR-first
+ * architecture: it fetches PRs from GitHub with server-side date filtering,
+ * then looks up CircleCI pipelines per PR branch, avoiding the need to
+ * paginate through the entire pipeline history.
  *
  * USAGE:
  *   node circleci-ttg.js
@@ -54,13 +54,15 @@
  *   - Pipeline duration calculations for TTG analysis
  *   - Summary statistics
  *
- * FEATURES:
- *   - Fetches pipelines and workflows from CircleCI API
- *   - Integrates with GitHub API for PR details
- *   - Filters to only PR-triggered pipelines
- *   - Parallel processing with rate limiting
- *   - Detailed logging and progress tracking
- *   - Comprehensive error handling and retry logic
+ * ARCHITECTURE:
+ *   1. Fetch PRs from GitHub Search API (server-side date filtering)
+ *   2. For each PR, fetch its head branch details from GitHub
+ *   3. Use CircleCI's branch filter to fetch only pipelines for that branch
+ *   4. Match pipelines to the PR via commit SHA membership
+ *   5. Fetch workflows for matched pipelines
+ *
+ *   This avoids paginating through the entire CircleCI pipeline history,
+ *   making historical date range queries efficient regardless of repo age.
  */
 
 const { mkdirSync, writeFileSync } = require('fs');
@@ -146,6 +148,8 @@ if (!SINCE_DATE || !UNTIL_DATE) {
  * @property {string} [merged_at]
  * @property {string} [closed_at]
  * @property {boolean} merged
+ * @property {string} head_branch - Head branch name of the PR
+ * @property {string[]} commit_shas - Commit SHAs belonging to this PR
  */
 
 /**
@@ -414,15 +418,147 @@ async function makeCircleCIRequest(url) {
 }
 
 /**
- * Fetch all pipelines within date range for a specific project
- * @param {string} since
- * @param {string} until
- * @returns {Promise<CircleCIPipeline[]>}
+ * Fetch PRs from GitHub Search API with server-side date filtering
+ * @param {string} since - ISO date string
+ * @param {string} until - ISO date string
+ * @returns {Promise<GitHubPullRequest[]>}
  */
-async function fetchPipelines(since, until) {
-  console.log('🔍 Searching Pipelines...');
+async function fetchPullRequests(since, until) {
+  console.log('🔍 Searching PRs...');
   const searchStart = Date.now();
 
+  /** @type {GitHubPullRequest[]} */
+  const allPRs = [];
+  let page = 1;
+  let hasMore = true;
+
+  // Convert to YYYY-MM-DD format for GitHub search
+  const sinceDate = since.split('T')[0];
+  const untilDate = until.split('T')[0];
+
+  console.log(`📅 Date range: ${sinceDate} → ${untilDate}`);
+
+  while (hasMore) {
+    const pageStart = Date.now();
+    console.log(`  📄 Page ${page}...`);
+
+    // Use GitHub Search API with precise date filtering
+    const searchQuery = `repo:${CIRCLECI_ORG}/${CIRCLECI_PROJECT} is:pr created:${sinceDate}..${untilDate}`;
+    const encodedQuery = encodeURIComponent(searchQuery);
+    const url = `https://api.github.com/search/issues?q=${encodedQuery}&sort=created&order=desc&per_page=100&page=${page}`;
+
+    const data = await makeGitHubRequest(url);
+
+    if (!data.items || data.items.length === 0) {
+      break;
+    }
+
+    console.log(
+      `    ✅ Found ${data.items.length} PRs (${Date.now() - pageStart}ms)`
+    );
+
+    // Convert search results to our PR format (branch and commits are fetched later)
+    for (const item of data.items) {
+      allPRs.push({
+        number: item.number,
+        title: item.title,
+        state: item.state,
+        created_at: item.created_at,
+        merged_at: item.pull_request?.merged_at || null,
+        closed_at: item.closed_at,
+        merged: false, // Will be enriched in fetchPRDetails
+        head_branch: '', // Will be enriched in fetchPRDetails
+        commit_shas: [], // Will be enriched in fetchPRCommitSHAs
+      });
+    }
+
+    // GitHub Search API returns max 100 per page
+    hasMore = data.items.length === 100;
+    page++;
+
+    // Small delay between requests
+    if (hasMore) {
+      await delay(100);
+    }
+  }
+
+  const searchEnd = Date.now();
+  console.log(
+    `✅ Found ${allPRs.length} PRs total (${Math.round(
+      (searchEnd - searchStart) / 1000
+    )}s)`
+  );
+
+  return allPRs;
+}
+
+/**
+ * Fetch full PR details from GitHub (includes head branch, merged status)
+ * @param {number} prNumber
+ * @returns {Promise<{head_branch: string, merged: boolean} | null>}
+ */
+async function fetchPRDetails(prNumber) {
+  try {
+    const url = `https://api.github.com/repos/${CIRCLECI_ORG}/${CIRCLECI_PROJECT}/pulls/${prNumber}`;
+    const pr = await makeGitHubRequest(url);
+    return {
+      head_branch: pr.head?.ref || '',
+      merged: pr.merged || false,
+    };
+  } catch (error) {
+    console.log(
+      `    ⚠️  Failed to fetch PR #${prNumber} details: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return null;
+  }
+}
+
+/**
+ * Fetch commit SHAs for a pull request
+ * @param {number} prNumber
+ * @returns {Promise<string[]>}
+ */
+async function fetchPRCommitSHAs(prNumber) {
+  /** @type {string[]} */
+  const commits = [];
+  let page = 1;
+  let hasMore = true;
+
+  while (hasMore) {
+    const url = `https://api.github.com/repos/${CIRCLECI_ORG}/${CIRCLECI_PROJECT}/pulls/${prNumber}/commits?page=${page}&per_page=100`;
+    const data = await makeGitHubRequest(url);
+
+    if (!Array.isArray(data) || data.length === 0) {
+      break;
+    }
+
+    for (const commit of data) {
+      commits.push(commit.sha);
+    }
+
+    hasMore = data.length === 100;
+    page++;
+
+    if (hasMore) {
+      await delay(10);
+    }
+  }
+
+  return commits;
+}
+
+/**
+ * Fetch CircleCI pipelines for a specific branch, filtered to the date range.
+ * Uses the CircleCI branch query parameter to avoid paginating through the
+ * entire project history.
+ * @param {string} branch - Branch name to filter by
+ * @param {string} since - ISO date string (start of range)
+ * @param {string} until - ISO date string (end of range)
+ * @returns {Promise<CircleCIPipeline[]>}
+ */
+async function fetchPipelinesForBranch(branch, since, until) {
   /** @type {CircleCIPipeline[]} */
   const allPipelines = [];
   let pageToken = null;
@@ -430,20 +566,9 @@ async function fetchPipelines(since, until) {
 
   const projectSlug = `${CIRCLECI_VCS_TYPE}/${CIRCLECI_ORG}/${CIRCLECI_PROJECT}`;
 
-  // Convert to YYYY-MM-DD format for CircleCI API
-  const sinceDate = since.split('T')[0];
-  const untilDate = until.split('T')[0];
-
-  console.log(`📅 Date range: ${sinceDate} → ${untilDate}`);
-  console.log(`📊 Project: ${projectSlug}`);
-
   while (hasMore) {
-    const pageStart = Date.now();
-    console.log(
-      `  📄 Page ${pageToken ? `(${pageToken.substring(0, 8)}...)` : '1'}...`
-    );
-
     const params = new URLSearchParams();
+    params.append('branch', branch);
     if (pageToken) {
       params.append('page-token', pageToken);
     }
@@ -455,53 +580,33 @@ async function fetchPipelines(since, until) {
       break;
     }
 
-    // Filter pipelines by date range
-    const filteredPipelines = data.items.filter((pipeline) => {
-      const pipelineDate = new Date(pipeline.created_at);
-      const isInDateRange =
-        pipelineDate >= new Date(since) && pipelineDate <= new Date(until);
+    // Client-side date range filtering
+    const sinceTime = new Date(since).getTime();
+    const untilTime = new Date(until).getTime();
 
-      return isInDateRange;
-    });
+    for (const pipeline of data.items) {
+      const pipelineTime = new Date(pipeline.created_at).getTime();
+      if (pipelineTime >= sinceTime && pipelineTime <= untilTime) {
+        allPipelines.push(pipeline);
+      }
+    }
 
-    console.log(
-      `    ✅ Found ${data.items.length} total, ${
-        filteredPipelines.length
-      } matching pipelines (${Date.now() - pageStart}ms)`
-    );
-
-    allPipelines.push(...filteredPipelines);
-
-    // CircleCI returns pipelines in reverse chronological order (newest first).
-    // Once all pipelines on a page are older than the `since` date, every
-    // subsequent page will only contain even older pipelines — stop early to
-    // avoid paginating through the entire project history.
+    // Stop early once all pipelines on a page are older than the since date
+    // (CircleCI returns pipelines newest-first)
     const allBeforeSince = data.items.every(
-      (p) => new Date(p.created_at) < new Date(since)
+      (p) => new Date(p.created_at).getTime() < sinceTime
     );
     if (allBeforeSince) {
-      console.log(
-        `  ⏹️  All pipelines on this page are before ${sinceDate}, stopping pagination`
-      );
       break;
     }
 
-    // Check for more pages
     pageToken = data.next_page_token;
     hasMore = !!pageToken;
 
-    // Small delay between requests
     if (hasMore) {
       await delay(100);
     }
   }
-
-  const searchEnd = Date.now();
-  console.log(
-    `✅ Found ${allPipelines.length} pipelines total (${Math.round(
-      (searchEnd - searchStart) / 1000
-    )}s)`
-  );
 
   return allPipelines;
 }
@@ -516,18 +621,6 @@ async function fetchWorkflowsForPipeline(pipelineId) {
   const data = await makeCircleCIRequest(url);
 
   return data.items || [];
-}
-
-/**
- * Extract commit SHA from CircleCI pipeline
- * @param {CircleCIPipeline} pipeline
- * @returns {string|null}
- */
-function extractCommitShaFromPipeline(pipeline) {
-  if (pipeline.vcs && pipeline.vcs.revision) {
-    return pipeline.vcs.revision;
-  }
-  return null;
 }
 
 /**
@@ -554,7 +647,7 @@ function isBranchExcluded(branchName, excludedPatterns) {
 }
 
 // ============================================================================
-// GITHUB VCS PROVIDER INTEGRATION
+// GITHUB API
 // ============================================================================
 
 /**
@@ -580,46 +673,149 @@ async function makeGitHubRequest(url) {
   return response.json();
 }
 
-/**
- * Fetch PR details from GitHub API using commit SHA
- * @param {string} owner - GitHub repository owner
- * @param {string} repo - GitHub repository name
- * @param {string} commitSha - Commit hash to find PR for
- * @returns {Promise<GitHubPullRequest | null>}
- */
-async function fetchPRDetailsFromGitHub(owner, repo, commitSha) {
-  try {
-    const url = `https://api.github.com/repos/${owner}/${repo}/commits/${commitSha}/pulls`;
-    const pulls = await makeGitHubRequest(url);
-
-    if (!Array.isArray(pulls) || pulls.length === 0) {
-      return null;
-    }
-
-    // Return the first PR associated with this commit
-    const pr = pulls[0];
-    return {
-      number: pr.number,
-      title: pr.title,
-      state: pr.state,
-      created_at: pr.created_at,
-      merged_at: pr.merged_at,
-      closed_at: pr.closed_at,
-      merged: pr.merged || false,
-    };
-  } catch (error) {
-    console.log(
-      `    ⚠️  Failed to fetch PR for commit ${commitSha}: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
-    return null;
-  }
-}
-
 // ============================================================================
 // MAIN EXECUTION FUNCTION
 // ============================================================================
+
+/**
+ * Process a single PR: fetch its branch details, commit SHAs, CircleCI
+ * pipelines (scoped to the branch), and workflows. Returns CSV rows.
+ *
+ * @param {GitHubPullRequest} pr
+ * @param {string} sinceISO
+ * @param {string} untilISO
+ * @param {string} repository
+ * @returns {Promise<{pr_id: number, pr_title: string, records: number, data: TTGDataRow[], pipelines: number, skip_reason?: string, error?: string}>}
+ */
+async function processPR(pr, sinceISO, untilISO, repository) {
+  try {
+    // Fetch full PR details (head branch, merged status)
+    const details = await fetchPRDetails(pr.number);
+    if (!details || !details.head_branch) {
+      return {
+        pr_id: pr.number,
+        pr_title: pr.title,
+        records: 0,
+        data: [],
+        pipelines: 0,
+        skip_reason: 'no_branch',
+      };
+    }
+
+    pr.head_branch = details.head_branch;
+    pr.merged = details.merged;
+
+    // Check branch exclusion early, before any CircleCI API calls
+    if (isBranchExcluded(pr.head_branch, excludedBranchPatterns)) {
+      return {
+        pr_id: pr.number,
+        pr_title: pr.title,
+        records: 0,
+        data: [],
+        pipelines: 0,
+        skip_reason: 'excluded_branch',
+      };
+    }
+
+    // Fetch the PR's commit SHAs (used to verify pipeline ownership)
+    const commitSHAs = await fetchPRCommitSHAs(pr.number);
+    pr.commit_shas = commitSHAs;
+    const commitSet = new Set(commitSHAs);
+
+    // Fetch CircleCI pipelines for this branch (scoped query, not full history)
+    const pipelines = await fetchPipelinesForBranch(
+      pr.head_branch,
+      sinceISO,
+      untilISO
+    );
+
+    if (pipelines.length === 0) {
+      return {
+        pr_id: pr.number,
+        pr_title: pr.title,
+        records: 0,
+        data: [],
+        pipelines: 0,
+        skip_reason: 'no_pipelines',
+      };
+    }
+
+    // Filter pipelines to only those whose commit SHA belongs to this PR.
+    // This handles the case where multiple PRs share the same branch name.
+    const matchedPipelines = pipelines.filter((pipeline) => {
+      const sha = pipeline.vcs?.revision;
+      return sha && commitSet.has(sha);
+    });
+
+    if (matchedPipelines.length === 0) {
+      return {
+        pr_id: pr.number,
+        pr_title: pr.title,
+        records: 0,
+        data: [],
+        pipelines: pipelines.length,
+        skip_reason: 'no_matching_pipelines',
+      };
+    }
+
+    // Fetch workflows for each matched pipeline
+    /** @type {TTGDataRow[]} */
+    const prData = [];
+    const prStatus = pr.merged ? `${pr.state}:merged` : pr.state;
+
+    for (const pipeline of matchedPipelines) {
+      const workflows = await fetchWorkflowsForPipeline(pipeline.id);
+
+      for (const workflow of workflows) {
+        prData.push({
+          platform: 'circleci',
+          repository,
+          pr_id: pr.number.toString(),
+          pr_title: pr.title,
+          pr_status: prStatus,
+          pr_created_at: pr.created_at,
+          pr_closed_at: pr.closed_at || pr.merged_at || null,
+          pipeline_id: pipeline.id,
+          pipeline_status: workflow.status,
+          pipeline_result:
+            workflow.status === 'success'
+              ? 'success'
+              : workflow.status === 'failed'
+              ? 'failed'
+              : workflow.status,
+          pipeline_start_time: workflow.created_at,
+          pipeline_finish_time: workflow.stopped_at || workflow.created_at,
+          pipeline_excluded_duration_ms: 0,
+          pipeline_excluded_stages: '',
+          pipeline_author: pipeline.trigger?.actor?.login || '',
+          pipeline_requested_for: pipeline.trigger?.actor?.login || '',
+        });
+      }
+    }
+
+    return {
+      pr_id: pr.number,
+      pr_title: pr.title,
+      records: prData.length,
+      data: prData,
+      pipelines: matchedPipelines.length,
+    };
+  } catch (error) {
+    console.log(
+      `    ❌ PR #${pr.number}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return {
+      pr_id: pr.number,
+      pr_title: pr.title,
+      records: 0,
+      data: [],
+      pipelines: 0,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 
 /**
  * Main execution function
@@ -655,172 +851,46 @@ async function runAnalysis() {
   console.log(`📅 Period: ${SINCE_DATE} → ${UNTIL_DATE}`);
   console.log(`🚫 Excluded branches: ${CIRCLECI_EXCLUDED_BRANCHES}`);
 
-  // Step 1: Fetch Pipelines
-  logger.logStep('Fetching Pipelines');
-  const pipelines = await fetchPipelines(sinceISO, untilISO);
-  logger.logSuccess(`${pipelines.length} pipelines found`);
+  // Step 1: Fetch PRs from GitHub (server-side date filtering)
+  logger.logStep('Fetching PRs from GitHub');
+  const prs = await fetchPullRequests(sinceISO, untilISO);
+  logger.logSuccess(`${prs.length} PRs found`);
 
-  if (pipelines.length === 0) {
-    console.log('❌ No pipelines found');
+  if (prs.length === 0) {
+    console.log('❌ No PRs found in date range');
     return;
   }
 
-  // Step 2: Collect Pipeline and PR data in parallel
-  logger.logStep('Collecting pipeline and PR data');
+  // Step 2: For each PR, fetch branch pipelines and workflows
+  logger.logStep('Collecting pipeline and workflow data per PR');
   const collectionStart = Date.now();
 
   /** @type {TTGDataRow[]} */
   const csvData = [];
   const repository = `${CIRCLECI_ORG}/${CIRCLECI_PROJECT}`;
 
-  // Process pipelines in parallel batches
+  // Process PRs in parallel batches
   const batchSize = 6;
   let processedCount = 0;
   let totalRecords = 0;
-  let prPipelinesCount = 0;
+  let prsWithPipelines = 0;
 
-  for (let i = 0; i < pipelines.length; i += batchSize) {
-    const batch = pipelines.slice(i, i + batchSize);
+  for (let i = 0; i < prs.length; i += batchSize) {
+    const batch = prs.slice(i, i + batchSize);
     const batchStart = Date.now();
 
-    // Log batch start
     const batchNum = Math.floor(i / batchSize) + 1;
-    const totalBatches = Math.ceil(pipelines.length / batchSize);
+    const totalBatches = Math.ceil(prs.length / batchSize);
     console.log(
-      `\n📦 Processing batch ${batchNum}/${totalBatches} (${batch.length} pipelines):`
+      `\n📦 Processing batch ${batchNum}/${totalBatches} (${batch.length} PRs):`
     );
-    batch.forEach((pipeline, idx) => {
-      console.log(
-        `  • Pipeline #${pipeline.number} (${i + idx + 1}/${
-          pipelines.length
-        }): ${pipeline.id.substring(0, 8)}... (${new Date(
-          pipeline.created_at
-        ).toLocaleDateString()})`
-      );
+    batch.forEach((pr, idx) => {
+      logger.logPRProcessing(pr.number, i + idx + 1, prs.length, pr.title);
     });
 
-    const batchPromises = batch.map(async (pipeline) => {
-      try {
-        // Extract commit SHA from pipeline
-        const commitSha = extractCommitShaFromPipeline(pipeline);
-
-        if (!commitSha) {
-          return {
-            pipeline: pipeline.number,
-            workflows: 0,
-            records: 0,
-            data: [],
-            skip_reason: 'no_commit_sha',
-          };
-        }
-
-        // Fetch PR details from GitHub (only for GitHub VCS type)
-        let prDetails = null;
-        if (CIRCLECI_VCS_TYPE === 'github') {
-          prDetails = await fetchPRDetailsFromGitHub(
-            CIRCLECI_ORG,
-            CIRCLECI_PROJECT,
-            commitSha
-          );
-        }
-
-        // Skip non-PR pipelines
-        if (!prDetails) {
-          return {
-            pipeline: pipeline.number,
-            workflows: 0,
-            records: 0,
-            data: [],
-            skip_reason: 'no_pr_found',
-          };
-        }
-
-        // Skip pipelines run on excluded branches - only include feature branch pipelines
-        const branch = pipeline.vcs?.branch;
-        if (isBranchExcluded(branch, excludedBranchPatterns)) {
-          return {
-            pipeline: pipeline.number,
-            workflows: 0,
-            records: 0,
-            data: [],
-            skip_reason: 'excluded_branch',
-            branch: branch || 'unknown',
-            excluded_patterns: CIRCLECI_EXCLUDED_BRANCHES,
-          };
-        }
-
-        // Fetch workflows for this pipeline
-        const workflows = await fetchWorkflowsForPipeline(pipeline.id);
-
-        // Only record pipeline if there are workflows
-        if (workflows.length > 0) {
-          /** @type {TTGDataRow[]} */
-          const pipelineData = [];
-
-          // Convert each workflow to CSV format
-          for (const workflow of workflows) {
-            const prStatus = prDetails.merged
-              ? `${prDetails.state}:merged`
-              : prDetails.state;
-
-            pipelineData.push({
-              platform: 'circleci',
-              repository,
-              pr_id: prDetails.number.toString(),
-              pr_title: prDetails.title,
-              pr_status: prStatus,
-              pr_created_at: prDetails.created_at,
-              pr_closed_at: prDetails.closed_at || prDetails.merged_at || null,
-              pipeline_id: pipeline.id,
-              pipeline_status: workflow.status,
-              pipeline_result:
-                workflow.status === 'success'
-                  ? 'success'
-                  : workflow.status === 'failed'
-                  ? 'failed'
-                  : workflow.status,
-              pipeline_start_time: workflow.created_at,
-              pipeline_finish_time: workflow.stopped_at || workflow.created_at,
-              pipeline_excluded_duration_ms: 0, // No stage exclusions for CircleCI
-              pipeline_excluded_stages: '', // No stage exclusions for CircleCI
-              pipeline_author: pipeline.trigger?.actor?.login || '',
-              pipeline_requested_for: pipeline.trigger?.actor?.login || '',
-            });
-          }
-
-          return {
-            pipeline: pipeline.number,
-            workflows: workflows.length,
-            records: pipelineData.length,
-            data: pipelineData,
-            pr_id: prDetails.number,
-            pr_title: prDetails.title.substring(0, 50),
-          };
-        } else {
-          return {
-            pipeline: pipeline.number,
-            workflows: 0,
-            records: 0,
-            data: [],
-            skip_reason: 'no_workflows',
-          };
-        }
-      } catch (error) {
-        console.log(
-          `    ❌ Pipeline #${pipeline.number}: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-        return {
-          pipeline: pipeline.number,
-          workflows: 0,
-          records: 0,
-          data: [],
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    });
-
+    const batchPromises = batch.map((pr) =>
+      processPR(pr, sinceISO, untilISO, repository)
+    );
     const batchResults = await Promise.all(batchPromises);
 
     // Log batch results
@@ -835,26 +905,24 @@ async function runAnalysis() {
       if (result.error) {
         errorCount++;
       } else if (result.records > 0) {
-        prPipelinesCount++;
+        prsWithPipelines++;
         console.log(
-          `    ✅ Pipeline #${result.pipeline} (PR #${result.pr_id}): ${result.workflows} workflows, ${result.records} records - ${result.pr_title}`
+          `    ✅ PR #${result.pr_id}: ${result.pipelines} pipelines, ${
+            result.records
+          } records - ${truncateString(result.pr_title, 50)}`
         );
       } else {
         const reason =
-          result.skip_reason === 'no_commit_sha'
-            ? 'no commit SHA'
-            : result.skip_reason === 'no_pr_found'
-            ? 'not a PR'
+          result.skip_reason === 'no_branch'
+            ? 'no branch info'
             : result.skip_reason === 'excluded_branch'
-            ? `excluded branch (${result.branch || 'unknown'}) - patterns: ${
-                result.excluded_patterns
-              }`
-            : result.skip_reason === 'no_workflows'
-            ? 'no workflows'
+            ? 'excluded branch'
+            : result.skip_reason === 'no_pipelines'
+            ? 'no pipelines on branch'
+            : result.skip_reason === 'no_matching_pipelines'
+            ? 'no pipelines matched PR commits'
             : 'unknown reason';
-        console.log(
-          `    ⚠️  Pipeline #${result.pipeline}: skipped (${reason})`
-        );
+        console.log(`    ⚠️  PR #${result.pr_id}: skipped (${reason})`);
       }
     });
 
@@ -867,11 +935,9 @@ async function runAnalysis() {
       )}s${errorCount > 0 ? ` (${errorCount} errors)` : ''}`
     );
     console.log(
-      `📊 Progress: ${processedCount}/${
-        pipelines.length
-      } pipelines (${Math.round(
-        (processedCount / pipelines.length) * 100
-      )}%) | ${prPipelinesCount} PR pipelines | ${totalRecords} total records`
+      `📊 Progress: ${processedCount}/${prs.length} PRs (${Math.round(
+        (processedCount / prs.length) * 100
+      )}%) | ${prsWithPipelines} PRs with pipelines | ${totalRecords} total records`
     );
   }
 
@@ -891,8 +957,8 @@ async function runAnalysis() {
 
   console.log('\n🎉 Data Collection Summary');
   console.log(`  📊 Platform: CircleCI (${CIRCLECI_ORG}/${CIRCLECI_PROJECT})`);
-  console.log(`  📊 Pipelines processed: ${pipelines.length}`);
-  console.log(`  📊 PR pipelines: ${prPipelinesCount}`);
+  console.log(`  📊 PRs found: ${prs.length}`);
+  console.log(`  📊 PRs with pipelines: ${prsWithPipelines}`);
   console.log(`  📊 Total records: ${csvData.length}`);
   console.log(`  📁 CSV file: ${csvFilePath}`);
   console.log(`  ⏱️  Total time: ${Math.round(totalTime / 1000)}s`);
